@@ -19,11 +19,17 @@ except ImportError:
 
 API_URL = "https://cardfight.fandom.com"
 WIKI_BASE = "https://cardfight.fandom.com"
+YUYUTEI_SEARCH_URL = "https://yuyu-tei.jp/sell/vg/s/search"
 USER_AGENT = "VanguardCardBot/1.0 (contact: your-email)"
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "card_cache.json")
 CACHE_TTL = 7 * 24 * 60 * 60  # 7 days in seconds
+PRICE_CACHE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "price_cache.json"
+)
+PRICE_CACHE_TTL = 12 * 60 * 60  # 12 hours in seconds
 
 _cache = {}
+_price_cache = {}
 
 
 def _load_cache():
@@ -31,8 +37,12 @@ def _load_cache():
     try:
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
             loaded = json.load(f)
-        # Schema bump: drop entries from before image_url was added.
-        _cache = {k: v for k, v in loaded.items() if "image_url" in v}
+        # Schema bump: drop entries from before image_url/jp_name were added.
+        _cache = {
+            k: v
+            for k, v in loaded.items()
+            if "image_url" in v and "jp_name" in v
+        }
     except (OSError, ValueError):
         _cache = {}
 
@@ -47,6 +57,31 @@ def _save_cache():
 
 def _is_cache_fresh(entry):
     return time.time() - entry.get("timestamp", 0) < CACHE_TTL
+
+
+def _load_price_cache():
+    global _price_cache
+    try:
+        with open(PRICE_CACHE_FILE, "r", encoding="utf-8") as f:
+            _price_cache = json.load(f)
+    except (OSError, ValueError):
+        _price_cache = {}
+
+
+def _save_price_cache():
+    try:
+        with open(PRICE_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(_price_cache, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+def _is_price_cache_fresh(entry):
+    return time.time() - entry.get("timestamp", 0) < PRICE_CACHE_TTL
+
+
+_load_cache()
+_load_price_cache()
 
 
 def _api_get(params):
@@ -148,6 +183,81 @@ def get_card_effect(query: str) -> dict:
     return {"error": f"No card found matching '{query}'."}
 
 
+def _parse_int_text(tag) -> int:
+    if tag is None:
+        return 0
+    digits = re.sub(r"[^\d]", "", "".join(tag.stripped_strings))
+    return int(digits) if digits else 0
+
+
+def _parse_stock(tag) -> int | None:
+    if tag is None:
+        return None
+    digits = re.sub(r"[^\d]", "", "".join(tag.stripped_strings))
+    return int(digits) if digits else None
+
+
+def _extract_rarity(set_code: str, alt: str | None) -> str | None:
+    # Yuyu-tei alt text looks like "D-BT11/FFR03 FFR ドラグリッター ...":
+    # second whitespace token is the rarity code.
+    if alt:
+        parts = alt.split()
+        if len(parts) >= 2 and parts[0] == set_code and re.fullmatch(r"[A-Z]+", parts[1]):
+            return parts[1]
+    # Fallback: strip trailing digits from the last slash segment, e.g. FFR03 -> FFR.
+    segment = set_code.rsplit("/", 1)[-1]
+    match = re.match(r"([A-Z]+)\d*$", segment)
+    if match:
+        return match.group(1)
+    return None
+
+
+def get_yuyutei_prices(jp_name: str) -> list[dict]:
+    if jp_name in _price_cache and _is_price_cache_fresh(_price_cache[jp_name]):
+        return _price_cache[jp_name]["listings"]
+
+    resp = requests.get(
+        YUYUTEI_SEARCH_URL,
+        params={"search_word": jp_name},
+        headers={"User-Agent": USER_AGENT},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    results = []
+    for card in soup.find_all(class_="card-product"):
+        set_span = card.find(
+            "span",
+            class_=lambda c: bool(c) and "border-dark" in c and "text-center" in c,
+        )
+        if set_span is None:
+            continue
+        set_code = "".join(set_span.stripped_strings).strip()
+        if not set_code:
+            continue
+
+        img = card.find("img", class_="card")
+        rarity = _extract_rarity(set_code, img.get("alt") if img else None)
+        price = _parse_int_text(card.find("strong"))
+        stock = _parse_stock(
+            card.find(class_=lambda c: bool(c) and "cart_sell_zaiko" in c)
+        )
+        results.append(
+            {
+                "rarity": rarity,
+                "set_code": set_code,
+                "price_yen": price,
+                "stock": stock,
+            }
+        )
+
+    results.sort(key=lambda x: x["price_yen"], reverse=True)
+    _price_cache[jp_name] = {"listings": results, "timestamp": time.time()}
+    _save_price_cache()
+    return results
+
+
 def _extract_effect_text(soup) -> str | None:
     effect_heading = None
     for tag in soup.find_all(["h2", "h3"]):
@@ -218,6 +328,28 @@ def _extract_infobox_image(soup):
     return url
 
 
+def extract_japanese_name(html: str) -> str | None:
+    soup = BeautifulSoup(html, "html.parser")
+    # Labeled "Kana" field in the infobox table (e.g. <td>Kana</td><td>ドラ...</td>).
+    for td in soup.find_all("td"):
+        if "".join(td.stripped_strings) == "Kana":
+            next_td = td.find_next("td")
+            if next_td is not None:
+                kana = "".join(next_td.stripped_strings).strip()
+                if kana:
+                    return kana
+    # Fallback: page title area shows "Name カナ" (kana after the English title).
+    header = soup.find(class_="header")
+    if header is not None:
+        text = "".join(header.stripped_strings)
+        match = re.search(r"[\u3040-\u30ff][\u3040-\u30ff\s]*", text)
+        if match:
+            kana = match.group(0).strip()
+            if kana:
+                return kana
+    return None
+
+
 def _fetch_card_effect(title: str) -> dict:
     data = _api_get(
         {
@@ -242,6 +374,7 @@ def _fetch_card_effect(title: str) -> dict:
         "url": f"{API_URL}/wiki/{title.replace(' ', '_')}",
         "effect": effect,
         "image_url": _extract_infobox_image(soup),
+        "jp_name": extract_japanese_name(html),
     }
 
 
@@ -249,11 +382,12 @@ def main():
     if len(sys.argv) < 2:
         print("Usage: python scraper.py <query>")
         sys.exit(1)
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
     query = " ".join(sys.argv[1:])
-    _load_cache()
     result = get_card_effect(query)
-    if "error" not in result:
-        _save_cache()
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

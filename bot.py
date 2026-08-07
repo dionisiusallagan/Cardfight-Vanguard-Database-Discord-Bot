@@ -8,7 +8,12 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
-from scraper import get_card_effect, get_card_effect_by_title, resolve_top_matches
+from scraper import (
+    get_card_effect,
+    get_card_effect_by_title,
+    get_yuyutei_prices,
+    resolve_top_matches,
+)
 
 load_dotenv()
 
@@ -22,6 +27,7 @@ if not TOKEN:
 MAX_LOOKUPS_PER_MESSAGE = 3
 MAX_LOOKUP_CHOICES = 1
 MAX_CANDIDATES = 5
+MAX_PRICE_QUERIES = 1
 MAX_EMBED_DESCRIPTION = 4096
 LOOKUP_TIMEOUT = 30.0
 TRUNCATION_SUFFIX = "\n… (truncated)"
@@ -50,6 +56,58 @@ def truncate_reply(text: str) -> str:
         return text
     cutoff = MAX_EMBED_DESCRIPTION - len(TRUNCATION_SUFFIX)
     return text[:cutoff].rstrip() + TRUNCATION_SUFFIX
+
+
+def format_price_line(item: dict) -> str:
+    rarity = item.get("rarity") or "?"
+    set_code = item.get("set_code", "")
+    price = f"¥{item['price_yen']:,}"
+    stock = item.get("stock")
+    if stock is None:
+        stock_text = "?"
+    else:
+        stock_text = str(stock)
+    return f"**{rarity}** ({set_code}) — {price} (stock: {stock_text})"
+
+
+def build_price_embed(title: str, listings: list[dict]) -> discord.Embed:
+    lines = [format_price_line(item) for item in listings]
+    return discord.Embed(title=title, description="\n".join(lines))
+
+
+async def handle_price(message: discord.Message, query: str):
+    async with message.channel.typing():
+        matches = resolve_top_matches(query, limit=1)
+
+    if not matches:
+        await message.reply(
+            f"⚠️ No card found matching '{query}'.",
+            mention_author=False,
+        )
+        return
+
+    title = matches[0]["title"]
+
+    async with message.channel.typing():
+        data = get_card_effect_by_title(title)
+        jp_name = data.get("jp_name")
+        if not jp_name:
+            await message.reply(
+                f"⚠️ Couldn't find a Japanese name for '{title}' to search prices.",
+                mention_author=False,
+            )
+            return
+        listings = get_yuyutei_prices(jp_name)
+
+    if not listings:
+        await message.reply(
+            f"⚠️ No Yuyu-tei listings found for '{title}'.",
+            mention_author=False,
+        )
+        return
+
+    embed = build_price_embed(title, listings)
+    await message.reply(embed=embed, mention_author=False)
 
 
 async def handle_lookup(message: discord.Message, query: str):
@@ -121,7 +179,7 @@ async def on_message(message: discord.Message):
 
     queries = [
         q.strip()
-        for q in re.findall(r"<<(?!lookup\?)(.+?)>>", message.content)
+        for q in re.findall(r"<<(?!(?:lookup|price)\?)(.+?)>>", message.content)
         if q.strip()
     ][:MAX_LOOKUPS_PER_MESSAGE]
 
@@ -130,6 +188,12 @@ async def on_message(message: discord.Message):
         for q in re.findall(r"<<lookup\?(.+?)>>", message.content)
         if q.strip()
     ][:MAX_LOOKUP_CHOICES]
+
+    price_queries = [
+        q.strip()
+        for q in re.findall(r"<<price\?(.+?)>>", message.content)
+        if q.strip()
+    ][:MAX_PRICE_QUERIES]
 
     for query in queries:
         async with message.channel.typing():
@@ -147,6 +211,9 @@ async def on_message(message: discord.Message):
 
     for query in lookup_queries:
         await handle_lookup(message, query)
+
+    for query in price_queries:
+        await handle_price(message, query)
 
     await bot.process_commands(message)
 
