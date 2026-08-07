@@ -8,7 +8,7 @@ import sys
 import time
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
 
 try:
     from rapidfuzz import fuzz
@@ -23,10 +23,12 @@ YUYUTEI_SEARCH_URL = "https://yuyu-tei.jp/sell/vg/s/search"
 USER_AGENT = "VanguardCardBot/1.0 (contact: your-email)"
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "card_cache.json")
 CACHE_TTL = 7 * 24 * 60 * 60  # 7 days in seconds
+CACHE_VERSION = 3  # bump when the fetched fields change, to invalidate stale entries
 PRICE_CACHE_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "price_cache.json"
 )
 PRICE_CACHE_TTL = 12 * 60 * 60  # 12 hours in seconds
+PRICE_CACHE_VERSION = 2  # bump when the parser changes, to invalidate stale entries
 
 _cache = {}
 _price_cache = {}
@@ -37,11 +39,13 @@ def _load_cache():
     try:
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
             loaded = json.load(f)
-        # Schema bump: drop entries from before image_url/jp_name were added.
+        # Schema bump: drop entries from before image_url/jp_name/version.
         _cache = {
             k: v
             for k, v in loaded.items()
-            if "image_url" in v and "jp_name" in v
+            if "image_url" in v
+            and "jp_name" in v
+            and v.get("version") == CACHE_VERSION
         }
     except (OSError, ValueError):
         _cache = {}
@@ -63,7 +67,13 @@ def _load_price_cache():
     global _price_cache
     try:
         with open(PRICE_CACHE_FILE, "r", encoding="utf-8") as f:
-            _price_cache = json.load(f)
+            loaded = json.load(f)
+        # Schema bump: drop entries cached by older parser versions.
+        _price_cache = {
+            k: v
+            for k, v in loaded.items()
+            if v.get("version") == PRICE_CACHE_VERSION and "listings" in v
+        }
     except (OSError, ValueError):
         _price_cache = {}
 
@@ -169,6 +179,7 @@ def get_card_effect_by_title(title: str) -> dict:
         result = _fetch_card_effect(title)
         if "error" not in result:
             result["timestamp"] = time.time()
+            result["version"] = CACHE_VERSION
             _cache[cache_key] = result
             _save_cache()
     return {k: v for k, v in result.items() if k != "timestamp"}
@@ -252,13 +263,10 @@ def _section_rarity(heading) -> str | None:
     return None
 
 
-def get_yuyutei_prices(jp_name: str) -> list[dict]:
-    if jp_name in _price_cache and _is_price_cache_fresh(_price_cache[jp_name]):
-        return _price_cache[jp_name]["listings"]
-
+def _fetch_yuyutei(search_word: str) -> list[dict]:
     resp = requests.get(
         YUYUTEI_SEARCH_URL,
-        params={"search_word": jp_name},
+        params={"search_word": search_word},
         headers={"User-Agent": USER_AGENT},
         timeout=20,
     )
@@ -301,7 +309,27 @@ def get_yuyutei_prices(jp_name: str) -> list[dict]:
                 results.append(entry)
 
     results.sort(key=lambda x: x["price_yen"], reverse=True)
-    _price_cache[jp_name] = {"listings": results, "timestamp": time.time()}
+    return results
+
+
+def get_yuyutei_prices(jp_name: str) -> list[dict]:
+    if jp_name in _price_cache and _is_price_cache_fresh(_price_cache[jp_name]):
+        return _price_cache[jp_name]["listings"]
+
+    results = _fetch_yuyutei(jp_name)
+    if not results:
+        # Some wiki kana fields include a title prefix Yuyu-tei spells
+        # differently (e.g. じゅんかんのフレデュール vs 春歓のフレデュール),
+        # so retry with just the base card name.
+        base_name = jp_name.split()[-1] if jp_name.split() else jp_name
+        if base_name and base_name != jp_name:
+            results = _fetch_yuyutei(base_name)
+
+    _price_cache[jp_name] = {
+        "listings": results,
+        "timestamp": time.time(),
+        "version": PRICE_CACHE_VERSION,
+    }
     _save_price_cache()
     return results
 
@@ -376,9 +404,46 @@ def _extract_infobox_image(soup):
     return url
 
 
+def _collect_header_text(node) -> str:
+    # Build text from the header's Japanese portion, dropping ruby <rt>
+    # annotations so we keep the kanji base (rb), not just the reading.
+    if node.name in ("rt", "small"):
+        return ""
+    if isinstance(node, NavigableString):
+        return str(node)
+    return "".join(_collect_header_text(child) for child in node.children)
+
+
+def _header_japanese_name(header) -> str | None:
+    # Header layout: "English Title<br/>Japanese Name" (kanji via ruby when
+    # present, e.g. 春歓のフレデュール, otherwise kana).
+    after = []
+    seen_br = False
+    for child in header.children:
+        if getattr(child, "name", None) == "br":
+            seen_br = True
+            continue
+        if seen_br:
+            after.append(_collect_header_text(child))
+    return "".join(after).strip() or None
+
+
 def extract_japanese_name(html: str) -> str | None:
     soup = BeautifulSoup(html, "html.parser")
-    # Labeled "Kana" field in the infobox table (e.g. <td>Kana</td><td>ドラ...</td>).
+    # Prefer the actual Japanese name shown next to the English title.
+    header = soup.find(class_="header")
+    if header is not None:
+        name = _header_japanese_name(header)
+        if name:
+            return name
+        # Header without a <br/> split: fall back to any kana run.
+        text = "".join(header.stripped_strings)
+        match = re.search(r"[\u3040-\u30ff][\u3040-\u30ff\s]*", text)
+        if match:
+            candidate = match.group(0).strip()
+            if candidate:
+                return candidate
+    # Fallback: labeled "Kana" field in the infobox table.
     for td in soup.find_all("td"):
         if "".join(td.stripped_strings) == "Kana":
             next_td = td.find_next("td")
@@ -386,15 +451,6 @@ def extract_japanese_name(html: str) -> str | None:
                 kana = "".join(next_td.stripped_strings).strip()
                 if kana:
                     return kana
-    # Fallback: page title area shows "Name カナ" (kana after the English title).
-    header = soup.find(class_="header")
-    if header is not None:
-        text = "".join(header.stripped_strings)
-        match = re.search(r"[\u3040-\u30ff][\u3040-\u30ff\s]*", text)
-        if match:
-            kana = match.group(0).strip()
-            if kana:
-                return kana
     return None
 
 
