@@ -1,4 +1,27 @@
 {
+  "フレデュール": {
+    "listings": [
+      {
+        "rarity": "FFR",
+        "set_code": "DZ-BT12/FFR16",
+        "price_yen": 3980,
+        "stock": 2
+      },
+      {
+        "rarity": "SR",
+        "set_code": "DZ-BT12/SR34",
+        "price_yen": 1280,
+        "stock": 0
+      },
+      {
+        "rarity": "RRR",
+        "set_code": "DZ-BT12/016",
+        "price_yen": 1280,
+        "stock": 1
+      }
+    ],
+    "timestamp": 1786085738.6781917
+  },
   "ドラグリッター ラティーファ": {
     "listings": [
       {
@@ -20,113 +43,6 @@
         "stock": null
       }
     ],
-    "timestamp": 1786084347.5872009
-  },
-  "ヴァージルア": {
-    "listings": [
-      {
-        "rarity": "FFR",
-        "set_code": "DZ-SS11/FFR01",
-        "price_yen": 2480,
-        "stock": null
-      },
-      {
-        "rarity": "PR",
-        "set_code": "D-PR/1016",
-        "price_yen": 780,
-        "stock": 7
-      },
-      {
-        "rarity": "TDR",
-        "set_code": "DZ-SS07/003R",
-        "price_yen": 580,
-        "stock": 3
-      },
-      {
-        "rarity": "RRR",
-        "set_code": "DZ-SS11/007",
-        "price_yen": 500,
-        "stock": null
-      },
-      {
-        "rarity": "FR",
-        "set_code": "DZ-BT02/FR05",
-        "price_yen": 220,
-        "stock": null
-      },
-      {
-        "rarity": "TDR",
-        "set_code": "DZ-SS07/002R",
-        "price_yen": 180,
-        "stock": 7
-      },
-      {
-        "rarity": "TDR",
-        "set_code": "DZ-SS07/004R",
-        "price_yen": 180,
-        "stock": 8
-      },
-      {
-        "rarity": "RR",
-        "set_code": "DZ-SS11/026",
-        "price_yen": 120,
-        "stock": null
-      },
-      {
-        "rarity": "R",
-        "set_code": "DZ-BT02/043",
-        "price_yen": 80,
-        "stock": null
-      },
-      {
-        "rarity": "TDR",
-        "set_code": "DZ-SS07/001R",
-        "price_yen": 80,
-        "stock": null
-      },
-      {
-        "rarity": "TD",
-        "set_code": "DZ-SS07/001",
-        "price_yen": 50,
-        "stock": null
-      },
-      {
-        "rarity": "TD",
-        "set_code": "DZ-SS07/002",
-        "price_yen": 50,
-        "stock": null
-      },
-      {
-        "rarity": "TD",
-        "set_code": "DZ-SS07/003",
-        "price_yen": 50,
-        "stock": null
-      },
-      {
-        "rarity": "TD",
-        "set_code": "DZ-SS07/004",
-        "price_yen": 50,
-        "stock": null
-      },
-      {
-        "rarity": "C",
-        "set_code": "DZ-BT02/069",
-        "price_yen": 30,
-        "stock": null
-      },
-      {
-        "rarity": "C",
-        "set_code": "DZ-BT02/072",
-        "price_yen": 30,
-        "stock": null
-      },
-      {
-        "rarity": "C",
-        "set_code": "DZ-BT02/074",
-        "price_yen": 30,
-        "stock": null
-      }
-    ],
-    "timestamp": 1786084452.000662
+    "timestamp": 1786085741.4001377
   }
 }

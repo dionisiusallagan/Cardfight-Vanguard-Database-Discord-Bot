@@ -193,8 +193,35 @@ def _parse_int_text(tag) -> int:
 def _parse_stock(tag) -> int | None:
     if tag is None:
         return None
-    digits = re.sub(r"[^\d]", "", "".join(tag.stripped_strings))
-    return int(digits) if digits else None
+    text = "".join(tag.stripped_strings)
+    digits = re.sub(r"[^\d]", "", text)
+    if digits:
+        return int(digits)
+    # Explicit out-of-stock markers (× ✕ ✗) mean 0 stock.
+    if re.search(r"[×✕✗]", text):
+        return 0
+    # Otherwise stock status isn't expressed numerically (e.g. ◯ "in stock").
+    return None
+
+
+def _product_to_dict(card, rarity) -> dict | None:
+    set_span = card.find(
+        "span",
+        class_=lambda c: bool(c) and "border-dark" in c and "text-center" in c,
+    )
+    if set_span is None:
+        return None
+    set_code = "".join(set_span.stripped_strings).strip()
+    if not set_code:
+        return None
+    return {
+        "rarity": rarity,
+        "set_code": set_code,
+        "price_yen": _parse_int_text(card.find("strong")),
+        "stock": _parse_stock(
+            card.find(class_=lambda c: bool(c) and "cart_sell_zaiko" in c)
+        ),
+    }
 
 
 def _extract_rarity(set_code: str, alt: str | None) -> str | None:
@@ -212,6 +239,19 @@ def _extract_rarity(set_code: str, alt: str | None) -> str | None:
     return None
 
 
+def _section_rarity(heading) -> str | None:
+    # Banner is <h3>...<span>SR</span> Card List</h3>: rarity lives in the span.
+    badge = heading.find("span")
+    if badge is not None:
+        rarity = "".join(badge.stripped_strings).strip()
+        if rarity:
+            return rarity
+    text = heading.get_text(" ", strip=True)
+    if " Card List" in text:
+        return text.split(" Card List", 1)[0].strip()
+    return None
+
+
 def get_yuyutei_prices(jp_name: str) -> list[dict]:
     if jp_name in _price_cache and _is_price_cache_fresh(_price_cache[jp_name]):
         return _price_cache[jp_name]["listings"]
@@ -226,31 +266,39 @@ def get_yuyutei_prices(jp_name: str) -> list[dict]:
     soup = BeautifulSoup(resp.text, "html.parser")
 
     results = []
-    for card in soup.find_all(class_="card-product"):
-        set_span = card.find(
-            "span",
-            class_=lambda c: bool(c) and "border-dark" in c and "text-center" in c,
-        )
-        if set_span is None:
-            continue
-        set_code = "".join(set_span.stripped_strings).strip()
-        if not set_code:
-            continue
-
-        img = card.find("img", class_="card")
-        rarity = _extract_rarity(set_code, img.get("alt") if img else None)
-        price = _parse_int_text(card.find("strong"))
-        stock = _parse_stock(
-            card.find(class_=lambda c: bool(c) and "cart_sell_zaiko" in c)
-        )
-        results.append(
-            {
-                "rarity": rarity,
-                "set_code": set_code,
-                "price_yen": price,
-                "stock": stock,
-            }
-        )
+    # Each rarity is a <div class="... cards-list ..."> section whose <h3>
+    # banner carries the rarity code (e.g. "SR Card List"), followed by the
+    # product cards for that rarity.
+    sections = soup.find_all(
+        "div",
+        class_=lambda c: bool(c) and "cards-list" in c and "py-4" in c,
+    )
+    if sections:
+        for section in sections:
+            heading = section.find("h3")
+            rarity = _section_rarity(heading) if heading is not None else None
+            for card in section.find_all(class_="card-product"):
+                entry = _product_to_dict(card, rarity)
+                if entry is not None:
+                    results.append(entry)
+    else:
+        # Fallback for pages that render products without the section layout.
+        for card in soup.find_all(class_="card-product"):
+            set_span = card.find(
+                "span",
+                class_=lambda c: bool(c) and "border-dark" in c and "text-center" in c,
+            )
+            if set_span is None:
+                continue
+            set_code = "".join(set_span.stripped_strings).strip()
+            if not set_code:
+                continue
+            img = card.find("img", class_="card")
+            entry = _product_to_dict(
+                card, _extract_rarity(set_code, img.get("alt") if img else None)
+            )
+            if entry is not None:
+                results.append(entry)
 
     results.sort(key=lambda x: x["price_yen"], reverse=True)
     _price_cache[jp_name] = {"listings": results, "timestamp": time.time()}
