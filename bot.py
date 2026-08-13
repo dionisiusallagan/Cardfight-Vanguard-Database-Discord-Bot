@@ -1,4 +1,4 @@
-"""Discord bot that looks up Cardfight!! Vanguard card effects via scraper.py."""
+"""Discord bot that looks up Cardfight!! Vanguard cards, prices, and decklists."""
 
 import asyncio
 import os
@@ -8,6 +8,12 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+from decklog_scraper import (
+    decklog_image_url,
+    decklog_view_url,
+    get_all_top_plays,
+    resolve_top_play,
+)
 from scraper import (
     get_card_effect,
     get_card_effect_by_title,
@@ -28,10 +34,12 @@ MAX_LOOKUPS_PER_MESSAGE = 3
 MAX_LOOKUP_CHOICES = 1
 MAX_CANDIDATES = 5
 MAX_PRICE_QUERIES = 1
+MAX_DECKLOG_QUERIES = 2
 MAX_EMBED_DESCRIPTION = 4096
 LOOKUP_TIMEOUT = 30.0
 TRUNCATION_SUFFIX = "\n… (truncated)"
 NUMBER_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+PAGE_EMOJIS = ("◀️", "▶️")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -172,6 +180,111 @@ async def handle_lookup(message: discord.Message, query: str):
         pass
 
 
+def build_decklog_embed(entry: dict, title: str, page: int, total: int) -> discord.Embed:
+    lines = []
+    if entry.get("event_name"):
+        lines.append(f"**{entry['event_name']}**")
+    if entry.get("date"):
+        lines.append(entry["date"])
+    if entry.get("location"):
+        lines.append(entry["location"])
+    if entry.get("rank") is not None:
+        lines.append(f"Rank {entry['rank']}")
+    if entry.get("player"):
+        lines.append(entry["player"])
+    if entry.get("set_name"):
+        lines.append(f"Set: {entry['set_name']}")
+    if entry.get("format"):
+        lines.append(f"Format: {entry['format']}")
+    if entry.get("list_url"):
+        lines.append(entry["list_url"])
+    embed = discord.Embed(title=title, description="\n".join(lines))
+    embed.set_footer(text=f"Top play {page + 1} of {total}")
+    return embed
+
+
+async def handle_decklog(message: discord.Message, query: str, lang: str):
+    async with message.channel.typing():
+        deck_name = resolve_top_play(query, lang)
+    if not deck_name:
+        await message.reply(
+            f"⚠️ No deck found matching '{query}'.",
+            mention_author=False,
+        )
+        return
+
+    async with message.channel.typing():
+        entries = get_all_top_plays(deck_name, lang)
+    playable = [e for e in entries if e.get("decklog_code")]
+    if not playable:
+        await message.reply(
+            f"⚠️ No Decklog lists found for '{deck_name}'.",
+            mention_author=False,
+        )
+        return
+
+    label = "Global" if lang == "en" else "JP"
+    title = f"{deck_name} ({label})"
+    index = 0
+    sent = None
+    while True:
+        entry = playable[index]
+        embed = build_decklog_embed(entry, title, index, len(playable))
+        image_host = entry.get("decklog_host") or lang
+        image_url = decklog_image_url(entry["decklog_code"], image_host)
+        if image_url:
+            embed.set_image(url=image_url)
+        if sent is None:
+            sent = await message.reply(embed=embed, mention_author=False)
+            if len(playable) > 1:
+                for emoji in PAGE_EMOJIS:
+                    await sent.add_reaction(emoji)
+        else:
+            await sent.edit(embed=embed)
+
+        def check(reaction, user):
+            return (
+                user == message.author
+                and user != bot.user
+                and reaction.message.id == sent.id
+                and str(reaction.emoji) in PAGE_EMOJIS
+            )
+
+        try:
+            reaction, _ = await bot.wait_for(
+                "reaction_add", timeout=LOOKUP_TIMEOUT, check=check
+            )
+        except asyncio.TimeoutError:
+            try:
+                await sent.clear_reactions()
+            except discord.HTTPException:
+                pass
+            return
+
+        if str(reaction.emoji) == PAGE_EMOJIS[0]:
+            index = (index - 1) % len(playable)
+        else:
+            index = (index + 1) % len(playable)
+
+
+async def handle_deck_direct(message: discord.Message, code: str, lang: str):
+    code = code.strip()
+    async with message.channel.typing():
+        image_url = decklog_image_url(code, lang)
+    if not image_url:
+        await message.reply(
+            f"⚠️ No decklist found for code '{code}'.",
+            mention_author=False,
+        )
+        return
+    embed = discord.Embed(
+        title=f"Decklist {code}",
+        url=decklog_view_url(code, lang),
+    )
+    embed.set_image(url=image_url)
+    await message.reply(embed=embed, mention_author=False)
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -179,7 +292,10 @@ async def on_message(message: discord.Message):
 
     queries = [
         q.strip()
-        for q in re.findall(r"<<(?!(?:lookup|price)\?)(.+?)>>", message.content)
+        for q in re.findall(
+            r"<<(?!(?:lookup|price|decklogen|decklogjp|decken|deckjp)\?)(.+?)>>",
+            message.content,
+        )
         if q.strip()
     ][:MAX_LOOKUPS_PER_MESSAGE]
 
@@ -194,6 +310,30 @@ async def on_message(message: discord.Message):
         for q in re.findall(r"<<price\?(.+?)>>", message.content)
         if q.strip()
     ][:MAX_PRICE_QUERIES]
+
+    decklog_en_queries = [
+        q.strip()
+        for q in re.findall(r"<<decklogen\?(.+?)>>", message.content)
+        if q.strip()
+    ][:MAX_DECKLOG_QUERIES]
+
+    decklog_jp_queries = [
+        q.strip()
+        for q in re.findall(r"<<decklogjp\?(.+?)>>", message.content)
+        if q.strip()
+    ][:MAX_DECKLOG_QUERIES]
+
+    deck_en_codes = [
+        q.strip()
+        for q in re.findall(r"<<decken\?(.+?)>>", message.content)
+        if q.strip()
+    ][:MAX_DECKLOG_QUERIES]
+
+    deck_jp_codes = [
+        q.strip()
+        for q in re.findall(r"<<deckjp\?(.+?)>>", message.content)
+        if q.strip()
+    ][:MAX_DECKLOG_QUERIES]
 
     for query in queries:
         async with message.channel.typing():
@@ -214,6 +354,18 @@ async def on_message(message: discord.Message):
 
     for query in price_queries:
         await handle_price(message, query)
+
+    for query in decklog_en_queries:
+        await handle_decklog(message, query, "en")
+
+    for query in decklog_jp_queries:
+        await handle_decklog(message, query, "jp")
+
+    for code in deck_en_codes:
+        await handle_deck_direct(message, code, "en")
+
+    for code in deck_jp_codes:
+        await handle_deck_direct(message, code, "jp")
 
     await bot.process_commands(message)
 
