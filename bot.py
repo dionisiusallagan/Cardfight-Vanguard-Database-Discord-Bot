@@ -3,6 +3,8 @@
 import asyncio
 import os
 import re
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import discord
 from discord.ext import commands
@@ -370,5 +372,33 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 
+HEALTH_HOST = os.getenv("HEALTH_HOST", "0.0.0.0")
+HEALTH_PORT = int(os.getenv("HEALTH_PORT", "5000"))
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    """Minimal liveness endpoint so cloud hosts (e.g. Replit Autoscale) treat
+    this process as a web service instead of scaling it to zero."""
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, *args):
+        pass
+
+
+def _start_health_server() -> threading.Thread:
+    server = ThreadingHTTPServer((HEALTH_HOST, HEALTH_PORT), _HealthHandler)
+    thread = threading.Thread(
+        target=server.serve_forever, daemon=True, name="health-server"
+    )
+    thread.start()
+    return thread
+
+
 if __name__ == "__main__":
+    _start_health_server()
     bot.run(TOKEN)
