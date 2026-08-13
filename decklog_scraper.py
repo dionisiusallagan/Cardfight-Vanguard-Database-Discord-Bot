@@ -51,7 +51,7 @@ DECKLOG_CACHE_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "decklog_cache.json"
 )
 DECKLOG_CACHE_TTL = 24 * 60 * 60  # 24 hours in seconds
-DECKLOG_CACHE_VERSION = 2  # bump to invalidate stale deck-name/entry caches
+DECKLOG_CACHE_VERSION = 3  # bump to invalidate stale deck-name/entry caches
 DECKLOG_IMAGE_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "decklog_images"
 )
@@ -62,18 +62,6 @@ DECKLOG_IMAGE_HOSTS = {
 DECKLOG_VIEW_BASES = {
     "en": "https://decklog-en.bushiroad.com/view",
     "jp": "https://decklog.bushiroad.com/view",
-}
-
-# The ranking/entry sheets mix several Bushiroad card games; a deck's "Nation"
-# column tells which game it belongs to. Only Cardfight Vanguard decks (the six
-# Standard nations) are relevant to this bot.
-VANGUARD_NATIONS = {
-    "Dragon Empire",
-    "Dark States",
-    "Brandt Gate",
-    "Stoicheia",
-    "Keter Sanctuary",
-    "Lyrical Monasterio",
 }
 
 
@@ -190,9 +178,10 @@ def _fuzzy_score(a: str, b: str) -> float:
 def get_deck_names(lang: str) -> list[str]:
     """Vanguard deck names for a format, from the ranking sheet's column A.
 
-    The sheet also tracks other Bushiroad games (Shaman King, Bang Dream,
-    Buddyfight, ...), so only rows whose Nation is a Cardfight Vanguard
-    nation are kept.
+    The sheets also list collaboration decks (e.g. "Fate Rewinder (CoroCoro)",
+    "MyGO"), whose Nation column is the collab theme rather than a Standard
+    nation; those are still Cardfight Vanguard decks, so every listed deck is
+    kept.
     """
     cfg = _TOPDECKS_SHEETS.get(lang)
     if cfg is None:
@@ -201,15 +190,11 @@ def get_deck_names(lang: str) -> list[str]:
     if key in _decklog_cache and _decklog_cache_fresh(_decklog_cache[key]):
         return _decklog_cache[key]["names"]
 
-    data = _gviz(cfg["sheet"] + cfg["rank_gid"], "Select A,H Order By A")
+    data = _gviz(cfg["sheet"] + cfg["rank_gid"], "Select A Order By A")
     names = []
     if data and "table" in data:
         for row in data["table"]["rows"]:
-            cells = row.get("c") or []
-            nation = (cells[1] or {}).get("v") if len(cells) > 1 else None
-            if nation not in VANGUARD_NATIONS:
-                continue
-            cell = cells[0]
+            cell = (row.get("c") or [None])[0]
             value = (cell or {}).get("v")
             if isinstance(value, str) and value.strip():
                 names.append(value.strip())
@@ -284,12 +269,6 @@ def _row_to_entry(cells: list, deck_name: str, cfg: dict) -> dict | None:
         if index >= len(cells) or cells[index] is None:
             return None
         return cells[index].get("v")
-
-    # Drop plays belonging to other Bushiroad games (guards against deck-name
-    # collisions across games sharing the same sheet).
-    nation = cell_value(cfg["nation_idx"])
-    if nation not in VANGUARD_NATIONS:
-        return None
 
     list_url = cell_value(cfg["list_idx"])
     if not isinstance(list_url, str) or not list_url.strip():
