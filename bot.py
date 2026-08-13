@@ -1,6 +1,8 @@
 """Discord bot that looks up Cardfight!! Vanguard cards, prices, and decklists."""
 
 import asyncio
+import io
+import json
 import os
 import re
 import threading
@@ -10,6 +12,7 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+from decklog_converter import convert_decklog
 from decklog_scraper import (
     decklog_image_url,
     decklog_view_url,
@@ -37,6 +40,7 @@ MAX_LOOKUP_CHOICES = 1
 MAX_CANDIDATES = 5
 MAX_PRICE_QUERIES = 1
 MAX_DECKLOG_QUERIES = 2
+MAX_DECKCFC_QUERIES = 1
 MAX_EMBED_DESCRIPTION = 4096
 LOOKUP_TIMEOUT = 30.0
 TRUNCATION_SUFFIX = "\n… (truncated)"
@@ -287,6 +291,44 @@ async def handle_deck_direct(message: discord.Message, code: str, lang: str):
     await message.reply(embed=embed, mention_author=False)
 
 
+async def handle_deck_cfc(message: discord.Message, code: str):
+    code = code.strip()
+    async with message.channel.typing():
+        try:
+            result = convert_decklog(code)
+        except ValueError as exc:
+            await message.reply(
+                f"⚠️ Could not convert decklist: {exc}",
+                mention_author=False,
+            )
+            return
+    if result is None:
+        await message.reply(
+            f"⚠️ No decklist found for code '{code}'.",
+            mention_author=False,
+        )
+        return
+    json_text = json.dumps(result, ensure_ascii=False)
+    if len(json_text) <= MAX_EMBED_DESCRIPTION:
+        await message.reply(
+            f"CFC deck JSON for `{code}` (`{len(result['mainDeck'])}` main "
+            f"/ `{len(result['rideDeck'])}` ride / "
+            f"`{len(result['strideDeck'])}` stride):\n```json\n"
+            + json_text
+            + "\n```",
+            mention_author=False,
+        )
+    else:
+        filename = f"{code}.json"
+        data = json_text.encode("utf-8")
+        fbuf = discord.File(io.BytesIO(data), filename=filename)
+        await message.reply(
+            content=f"CFC deck JSON for `{code}`:",
+            file=fbuf,
+            mention_author=False,
+        )
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -295,7 +337,7 @@ async def on_message(message: discord.Message):
     queries = [
         q.strip()
         for q in re.findall(
-            r"<<(?!(?:lookup|price|decklogen|decklogjp|decken|deckjp)\?)(.+?)>>",
+            r"<<(?!(?:lookup|price|decklogen|decklogjp|decken|deckjp|deckcfc)\?)(.+?)>>",
             message.content,
         )
         if q.strip()
@@ -337,6 +379,12 @@ async def on_message(message: discord.Message):
         if q.strip()
     ][:MAX_DECKLOG_QUERIES]
 
+    deck_cfc_codes = [
+        q.strip()
+        for q in re.findall(r"<<deckcfc\?(.+?)>>", message.content)
+        if q.strip()
+    ][:MAX_DECKCFC_QUERIES]
+
     for query in queries:
         async with message.channel.typing():
             result = get_card_effect(query)
@@ -368,6 +416,9 @@ async def on_message(message: discord.Message):
 
     for code in deck_jp_codes:
         await handle_deck_direct(message, code, "jp")
+
+    for code in deck_cfc_codes:
+        await handle_deck_cfc(message, code)
 
     await bot.process_commands(message)
 
