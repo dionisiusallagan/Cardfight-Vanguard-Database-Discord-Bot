@@ -73,6 +73,24 @@ REGULATION_MAP = {
     "B": 7,   # Break Ride
 }
 
+# Nationless (Elemental) trigger substitutes by CFC "gift" (trigger type).
+# The four Elementals are the canonical same-nationless triggers used when a
+# decklog card (e.g. a collab/mini-chara promo) is not in the CFC database.
+ELEMENTAL_TRIGGER_INDEX = {
+    "Heal": 3973,      # Wood Elemental, Leafy
+    "Critical": 2214,  # Light Elemental, Pachiri
+    "Draw": 1210,      # Earth Elemental, Garara
+    "Front": 1752,     # Heat Elemental, Marg
+}
+NATIONLESS_TRIGGER_GIFTS = set(ELEMENTAL_TRIGGER_INDEX)
+
+# JP card names known to exist on decklog but not in CFC, mapped to their
+# "gift" (trigger type) so they can be substituted by a same-type nationless
+# trigger. Extended as new collab/mini-chara promos are reported.
+COLLAB_TRIGGER_GIFTS = {
+    "ミニキャラ 八雲カゲツ": "Heal",
+}
+
 CACHE_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "cfc_deck_index_cache.json"
 )
@@ -81,7 +99,10 @@ NAME_CACHE_FILE = os.path.join(
 )
 CACHE_TTL = 7 * 24 * 60 * 60
 
+CARD_MAX_COPIES = 4
+
 _cfc_index_by_name: dict[str, int] | None = None
+_cfc_cards: dict[int, dict] | None = None
 _name_cache: dict[str, int] | None = None
 
 
@@ -161,10 +182,38 @@ def _load_cfc_index() -> dict[str, int]:
         for card in doc.get("cards", {}).values():
             name = card.get("name")
             if name:
-                index[name.lower()] = card["index"]
+                key = name.lower()
+                idx = card["index"]
+                if key not in index or idx < index[key]:
+                    index[key] = idx
     _cfc_index_by_name = index
     _save_cache(CACHE_FILE, index)
     return index
+
+
+def _load_cfc_cards() -> dict[int, dict]:
+    """index -> full CFC card dict (for effect-text matching)."""
+    global _cfc_cards
+    if _cfc_cards is not None:
+        return _cfc_cards
+    if not os.path.isfile(CFC_ASSETS):
+        raise FileNotFoundError(CFC_ASSETS)
+    with open(CFC_ASSETS, "rb") as f:
+        text = f.read().decode("latin1")
+    cards = {}
+    for doc_start in CFC_DOCS:
+        end = _find_json_end(text, doc_start)
+        if end == -1:
+            continue
+        try:
+            doc = json.loads(text[doc_start:end + 1])
+        except ValueError:
+            continue
+        for card in doc.get("cards", {}).values():
+            if card.get("name"):
+                cards[card["index"]] = card
+    _cfc_cards = cards
+    return cards
 
 
 # ------------------------------------------------------- name bridge
@@ -177,6 +226,48 @@ def _fuzzy_score(a: str, b: str) -> float:
     if RAPIDFUZZ_AVAILABLE:
         return fuzz.WRatio(a.lower(), b.lower())
     return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio() * 100
+
+
+def _clean_effect(text: str) -> str:
+    """Normalize a card effect for matching (drops wiki markup)."""
+    text = re.sub(r"\[\[(?:[^\]|]*\|)?([^\]]*)\]\]", r"\1", text)
+    text = re.sub(r"\{\{[^{}]*\}\}", " ", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"[’'\"“”]", "", text)
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def _wiki_page_meta(title: str) -> dict | None:
+    """grade/nation/effect for a wiki card page, or None."""
+    try:
+        resp = requests.get(
+            "https://cardfight.fandom.com/api.php",
+            params={
+                "action": "parse",
+                "page": title,
+                "prop": "wikitext",
+                "format": "json",
+            },
+            headers={"User-Agent": "VanguardCardBot/1.0"},
+            timeout=15,
+        )
+        txt = resp.json()["parse"]["wikitext"]["*"]
+    except (requests.RequestException, ValueError, KeyError):
+        return None
+    meta = {}
+    m_grade = re.search(r"\|\s*grade\s*=\s*(\d+)", txt)
+    if m_grade:
+        meta["grade"] = int(m_grade.group(1))
+    m_trig = re.search(r"\|\s*trig\s*=\s*(.+)", txt)
+    if m_trig:
+        meta["trig"] = m_trig.group(1).strip()
+    m_nation = re.search(r"\|\s*nation\s*=\s*(.+)", txt)
+    if m_nation:
+        meta["nations"] = [n.strip() for n in m_nation.group(1).split(",") if n.strip()]
+    m_effect = re.search(r"\|\s*effect\s*=\s*(.+?)\n(?:}}|$)", txt, re.S)
+    if m_effect:
+        meta["effect"] = _clean_effect(m_effect.group(1))
+    return meta or None
 
 
 def _wiki_opensearch(query: str) -> list[str]:
@@ -217,40 +308,81 @@ def _wiki_queries(jp_name: str) -> list[str]:
     return queries
 
 
-def _lookup_cfc_index(jp_name: str) -> int | None:
+def _lookup_cfc_index(jp_name: str, grade: int | None = None) -> int | None:
     """English name -> CFC index, with fallbacks for odd queries.
 
     Wiki opensearch ranks results by relevance, so we take the first title
     that has a solid CFC match rather than maximizing the score across all
     candidates (maximizing conflates similarly-named cards, e.g. two JP
     Rewinder cards that differ only by one kanji).
+
+    When no name matches strongly, fall back to effect-text matching: the CFC
+    translation sometimes differs from the wiki's title (e.g. CFC "Valgrowth
+    of Expansive Summer" vs wiki "Valgros of Summer's Expanse"), but the
+    abilities are textually near-identical, which uniquely identifies the card.
+
+    ``grade`` (optional) restricts candidates to that CFC grade; ride-deck
+    slots know their grade, which disambiguates e.g. "Estacion" (grade 0)
+    from "Legend of the Raging Skies, Estacion" (grade 2).
     """
     index = _load_cfc_index()
+    cards = _load_cfc_cards() if grade is not None else None
     seen = set()
+    first_title = None
     for query in _wiki_queries(jp_name):
         for title in _wiki_opensearch(query):
             title = re.sub(r"\s*\((?:card|unit|EN|JP)\)\s*$", "", title).strip()
             if title.startswith("Card Gallery:") or title in seen:
                 continue
+            if first_title is None:
+                first_title = title
             seen.add(title)
             # exact name in the CFC DB
             hit = index.get(_norm(title))
             if hit is not None:
-                return hit
+                if grade is None or cards[hit].get("grade") == grade:
+                    return hit
+                continue
             # first strong fuzzy CFC match, in wiki rank order
             best_idx = None
             best_score = 0.0
             for cfc_name, cfc_idx in index.items():
+                if grade is not None and cards[cfc_idx].get("grade") != grade:
+                    continue
                 sc = _fuzzy_score(title, cfc_name)
                 if sc > best_score:
                     best_score = sc
                     best_idx = cfc_idx
             if best_idx is not None and best_score >= 90:
                 return best_idx
+
+    # effect-text fallback: fetch the wiki page and match abilities
+    if first_title:
+        meta = _wiki_page_meta(first_title)
+        if meta and meta.get("effect"):
+            best_idx = None
+            best_score = 0.0
+            for cidx, card in _load_cfc_cards().items():
+                if grade is not None and card.get("grade") != grade:
+                    continue
+                if meta.get("grade") is not None and card.get("grade") != meta["grade"]:
+                    continue
+                if meta.get("nations") and card.get("nation"):
+                    if not set(meta["nations"]) & set(card["nation"]):
+                        continue
+                c_effect = _clean_effect(card.get("effect") or "")
+                if not c_effect:
+                    continue
+                sc = _fuzzy_score(meta["effect"], c_effect)
+                if sc > best_score:
+                    best_score = sc
+                    best_idx = cidx
+            if best_idx is not None and best_score >= 80:
+                return best_idx
     return None
 
 
-def jp_to_cfc_index(jp_name: str) -> int | None:
+def jp_to_cfc_index(jp_name: str, grade: int | None = None) -> int | None:
     """Map a decklog Japanese card name to a CFC index (cached).
 
     Only successful resolutions are cached; failures are re-attempted on the
@@ -260,9 +392,11 @@ def jp_to_cfc_index(jp_name: str) -> int | None:
     if _name_cache is None:
         _name_cache = _load_cache(NAME_CACHE_FILE) or {}
     key = jp_name.strip()
+    if grade is not None:
+        key = f"{key}||g{grade}"
     if key in _name_cache:
         return _name_cache[key]
-    idx = _lookup_cfc_index(key)
+    idx = _lookup_cfc_index(jp_name.strip(), grade)
     if idx is not None:
         _name_cache[key] = idx
         _save_cache(NAME_CACHE_FILE, _name_cache)
@@ -311,7 +445,7 @@ def _sort_cards(deck: dict, cards: list[dict]) -> list[str]:
         "deck_param1": deck.get("deck_param1"),
         "deck_param2": deck.get("deck_param2"),
         "no": [c["card_number"] for c in cards],
-        "sub_no": [],
+        "sub_no": [c["card_number"] for c in (deck.get("sub_list") or [])],
     }
     try:
         resp = s.post(
@@ -325,7 +459,100 @@ def _sort_cards(deck: dict, cards: list[dict]) -> list[str]:
         return []
 
 
+def _sort_sub_cards(deck: dict) -> list[str]:
+    """Order of sub_list card_numbers (stride/G zone) per the sort API."""
+    s = _decklog_session(str(deck.get("id", "")))
+    payload = {
+        "deck_param1": deck.get("deck_param1"),
+        "deck_param2": deck.get("deck_param2"),
+        "no": [c["card_number"] for c in deck.get("list", [])],
+        "sub_no": [c["card_number"] for c in (deck.get("sub_list") or [])],
+    }
+    try:
+        resp = s.post(
+            f"{DECKLOG_API}/sort/{deck.get('game_title_id')}",
+            json=payload,
+            timeout=30,
+        )
+        data = resp.json()
+        if not isinstance(data, dict):
+            return []
+        return data.get("sub_list", [])
+    except (requests.RequestException, ValueError):
+        return []
+
+
 # ------------------------------------------------------------- conversion
+
+def _collab_trigger_gift(jp_name: str) -> str | None:
+    """Trigger type for a collab/promo card missing from the CFC database.
+
+    Checks the known-missing names first, then asks the wiki for a card page
+    with a ``trig`` field. Returns the CFC gift string ("Heal"/"Critical"/
+    "Draw"/"Front") or None if the card is not a trigger.
+    """
+    known = COLLAB_TRIGGER_GIFTS.get(jp_name.strip())
+    if known:
+        return known
+    for query in _wiki_queries(jp_name):
+        for title in _wiki_opensearch(query):
+            title = re.sub(r"\s*\((?:card|unit|EN|JP)\)\s*$", "", title).strip()
+            if title.startswith("Card Gallery:"):
+                continue
+            meta = _wiki_page_meta(title)
+            if meta and meta.get("trig"):
+                return meta["trig"]
+    return None
+
+
+def _nationless_trigger_candidates(gift: str) -> list[int]:
+    """CFC indices of same-gift Nationless triggers, preferred first.
+
+    The canonical Elemental of that type leads the list; matching nationless
+    triggers (covers reskins and other Elemental-family cards) follow, so a
+    deck that already runs 4x the Elemental can still be built legally.
+    """
+    cards = _load_cfc_cards()
+    cands = []
+    elem = ELEMENTAL_TRIGGER_INDEX.get(gift)
+    if elem is not None:
+        cands.append(elem)
+    for idx, card in sorted(cards.items()):
+        if idx in cands:
+            continue
+        if card.get("type") != "Trigger Unit":
+            continue
+        if card.get("gift") != gift:
+            continue
+        if "Nationless" not in (card.get("nation") or []):
+            continue
+        cands.append(idx)
+    return cands
+
+
+def _substitute_trigger(
+    gift: str,
+    count: int,
+    main_deck: list[int],
+    counts: dict[int, int],
+) -> bool:
+    """Place ``count`` copies of a missing collab trigger into ``main_deck``
+    using same-gift Nationless triggers, never exceeding 4 copies of one card
+    (``counts`` tracks copies already in the deck). Returns True if all copies
+    were placed.
+    """
+    for _ in range(count):
+        placed = None
+        for cand in _nationless_trigger_candidates(gift):
+            if counts.get(cand, 0) < CARD_MAX_COPIES:
+                placed = cand
+                break
+        if placed is None:
+            return False
+        main_deck.append(placed)
+        counts[placed] = counts.get(placed, 0) + 1
+    return True
+
 
 def convert_decklog(code: str) -> dict:
     """Produce the CFC deck JSON for a decklog code.
@@ -350,15 +577,24 @@ def convert_decklog(code: str) -> dict:
     if not ordered_cards:
         ordered_cards = deck.get("list", [])
 
-    index = _load_cfc_index()
     main_deck = []
+    counts: dict[int, int] = {}
     unresolved = []
+    collab_triggers = []  # (name, num) placed after native cards are counted
     for card in ordered_cards:
         cidx = jp_to_cfc_index(card["name"])
-        if cidx is None:
-            unresolved.append(card["name"])
+        num = int(card["num"])
+        if cidx is not None:
+            main_deck.extend([cidx] * num)
+            counts[cidx] = counts.get(cidx, 0) + num
+        else:
+            collab_triggers.append((card["name"], num))
+
+    for name, num in collab_triggers:
+        gift = _collab_trigger_gift(name)
+        if gift is not None and _substitute_trigger(gift, num, main_deck, counts):
             continue
-        main_deck.extend([cidx] * int(card["num"]))
+        unresolved.append(name)
 
     # ride deck: p_list grade_0..grade_3 units in grade order
     ride_cards = {}
@@ -370,11 +606,28 @@ def convert_decklog(code: str) -> dict:
     for slot in ("grade_0", "grade_1", "grade_2", "grade_3"):
         card = ride_cards.get(slot)
         if card is not None:
-            cidx = jp_to_cfc_index(card["name"])
+            grade = int(slot.split("_")[1])
+            cidx = jp_to_cfc_index(card["name"], grade=grade)
             if cidx is None:
                 unresolved.append(card["name"])
             else:
                 ride_deck.append(cidx)
+
+    # stride deck: sub_list is the stride/G zone, in the site's display order
+    sub_cards = deck.get("sub_list") or []
+    stride_deck = []
+    if sub_cards:
+        sub_by_number = {c["card_number"]: c for c in sub_cards}
+        ordered_sub = [n for n in _sort_sub_cards(deck) if n in sub_by_number]
+        if not ordered_sub:
+            ordered_sub = [c["card_number"] for c in sub_cards]
+        for n in ordered_sub:
+            card = sub_by_number[n]
+            cidx = jp_to_cfc_index(card["name"], grade=4)
+            if cidx is None:
+                unresolved.append(card["name"])
+            else:
+                stride_deck.extend([cidx] * int(card.get("num") or 1))
 
     if unresolved:
         raise ValueError(
@@ -391,7 +644,7 @@ def convert_decklog(code: str) -> dict:
         "rideCrest": ride_crest,
         "mainDeck": main_deck,
         "rideDeck": ride_deck,
-        "strideDeck": [],
+        "strideDeck": stride_deck,
     }
 
 
